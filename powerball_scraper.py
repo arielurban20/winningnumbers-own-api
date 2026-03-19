@@ -29,66 +29,6 @@ def parse_spanish_date(raw_date: str):
     return datetime.strptime(f"{day} {mon_en} {year}", "%d %b %Y").date()
 
 
-def parse_powerball_page(html: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text("\n", strip=True)
-    full_text = clean_text(text)
-
-    date_match = re.search(
-        r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo)\s+(\d{1,2}\s+\w+\s+\d{4})",
-        text
-    )
-    draw_date = None
-    if date_match:
-        raw_date = date_match.group(2)
-        draw_date = parse_spanish_date(raw_date)
-
-    pp_match = re.search(r"Power Play[:\s]+(\d+)", full_text, re.IGNORECASE)
-    multiplier = pp_match.group(1) if pp_match else None
-
-    money_matches = re.findall(r"\d[\d\.\,]*\$", full_text)
-    jackpot = money_matches[0] if money_matches else None
-    double_play_jackpot = money_matches[1] if len(money_matches) > 1 else None
-
-    raw_numbers = re.findall(r"\b\d{1,2}\b", full_text)
-    filtered = [n for n in raw_numbers if 0 <= int(n) <= 99]
-
-    main_numbers = []
-    bonus_number = None
-    secondary_draws = []
-
-    if len(filtered) >= 6:
-        main_numbers = filtered[:5]
-        bonus_number = filtered[5]
-
-    if len(filtered) >= 12:
-        dp_main = filtered[6:11]
-        dp_bonus = filtered[11]
-        if len(dp_main) == 5:
-            secondary_draws.append({
-                "draw_type": "double-play",
-                "main_numbers": [int(x) for x in dp_main],
-                "bonus_number": str(dp_bonus),
-                "jackpot": double_play_jackpot,
-            })
-
-    if not draw_date or len(main_numbers) < 5:
-        raise ValueError("No se pudo extraer correctamente el resultado de Powerball")
-
-    return {
-        "draw_date": draw_date,
-        "draw_type": "main",
-        "draw_time": "22:59:00",
-        "main_numbers": [int(x) for x in main_numbers],
-        "bonus_number": str(bonus_number) if bonus_number else None,
-        "multiplier": str(multiplier) if multiplier else None,
-        "jackpot": jackpot,
-        "cash_payout": None,
-        "secondary_draws": secondary_draws if secondary_draws else None,
-        "notes": "Scraped from loteria.guru",
-    }
-
-
 def get_game_and_url():
     db = SessionLocal()
     try:
@@ -105,6 +45,107 @@ def get_game_and_url():
         return game.id, game.source_result_url
     finally:
         db.close()
+
+
+def extract_numbers_from_main_ul(ul):
+    lis = ul.find_all("li")
+    values = [clean_text(li.get_text(" ", strip=True)) for li in lis]
+
+    valid = [v for v in values if re.fullmatch(r"\d{1,2}", v)]
+    if len(valid) != 6:
+        return None, None
+
+    main_numbers = [int(x) for x in valid[:5]]
+    bonus_number = valid[5]
+    return main_numbers, bonus_number
+
+
+def parse_powerball_page(html: str) -> dict:
+    soup = BeautifulSoup(html, "lxml")
+    full_text = clean_text(soup.get_text("\n", strip=True))
+
+    # 1) RESULTADO PRINCIPAL Y DOUBLE PLAY
+    # Los buenos están en ul.lg-numbers.game-number
+    main_uls = soup.select("ul.lg-numbers.game-number")
+
+    if not main_uls:
+        raise ValueError("No se encontraron bloques principales ul.lg-numbers.game-number para Powerball")
+
+    valid_groups = []
+    for ul in main_uls:
+        main_numbers, bonus_number = extract_numbers_from_main_ul(ul)
+        if main_numbers and bonus_number:
+            valid_groups.append((main_numbers, bonus_number))
+
+    if not valid_groups:
+        raise ValueError("No se pudo extraer el grupo principal de números de Powerball")
+
+    # primer grupo = draw principal
+    main_numbers, bonus_number = valid_groups[0]
+
+    # segundo grupo = double play (si existe)
+    secondary_draws = None
+    if len(valid_groups) >= 2:
+        dp_main, dp_bonus = valid_groups[1]
+        secondary_draws = [{
+            "draw_type": "double-play",
+            "main_numbers": dp_main,
+            "bonus_number": dp_bonus,
+            "jackpot": None,
+        }]
+
+    # 2) FECHA Y JACKPOT DEL ÚLTIMO DRAW
+    # usar el texto más confiable que aparece en la página
+    latest_jackpot_match = re.search(
+        r"El último premio mayor,\s*sorteado el\s*(\d{1,2}\s+\w+\s+\d{4})\s*fue de\s*(\d[\d\.\,]*\$)",
+        full_text,
+        re.IGNORECASE
+    )
+
+    draw_date = None
+    jackpot = None
+
+    if latest_jackpot_match:
+        draw_date = parse_spanish_date(latest_jackpot_match.group(1))
+        jackpot = latest_jackpot_match.group(2)
+
+    # fallback de fecha si no aparece ese bloque
+    if not draw_date:
+        date_match = re.search(
+            r"(Lunes|Martes|Miércoles|Jueves|Viernes|Sábado|Domingo)\s+(\d{1,2}\s+\w+\s+\d{4})",
+            full_text,
+            re.IGNORECASE
+        )
+        if date_match:
+            draw_date = parse_spanish_date(date_match.group(2))
+
+    if not draw_date:
+        raise ValueError("No se pudo extraer la fecha de Powerball")
+
+    # fallback de jackpot
+    if not jackpot:
+        money_matches = re.findall(r"\d[\d\.\,]*\$", full_text)
+        jackpot = money_matches[0] if money_matches else None
+
+    # 3) POWER PLAY
+    # Si no sale claro, mejor dejarlo null que meter uno malo
+    multiplier = None
+    pp_match = re.search(r"Power\s*Play[:\s]x?\s(\d+)", full_text, re.IGNORECASE)
+    if pp_match:
+        multiplier = pp_match.group(1)
+
+    return {
+        "draw_date": draw_date,
+        "draw_type": "main",
+        "draw_time": "22:59:00",
+        "main_numbers": main_numbers,
+        "bonus_number": bonus_number,
+        "multiplier": str(multiplier) if multiplier else None,
+        "jackpot": jackpot,
+        "cash_payout": None,
+        "secondary_draws": secondary_draws,
+        "notes": "Scraped from loteria.guru",
+    }
 
 
 def save_draw(game_id: int, source_url: str, data: dict):
